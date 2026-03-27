@@ -1,0 +1,9 @@
+dash
+dash-bootstrap-components
+pandas
+plotly
+requests
+gunicorn
+psycopg2-binary
+SQLAlchemy
+apscheduler
