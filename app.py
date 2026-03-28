@@ -210,7 +210,7 @@ def update_dashboard(n, selected_models, show_markers):
             if not scale_up_df.empty: fig.add_trace(go.Scatter(x=scale_up_df['timestamp'], y=scale_up_df['utilization'], mode='markers', marker=dict(symbol='triangle-up', size=16, color='#2ecc71', line=dict(width=1, color='white')), name=f"{model_name} (Scale Up)", legendgroup=model_name, showlegend=False, hoverinfo='text', hovertext=[f"<b>SCALE UP EVENT</b><br>Instances: {row['instances']}<br>Action: {row['action_taken']}" for _, row in scale_up_df.iterrows()]))
             if not scale_down_df.empty: fig.add_trace(go.Scatter(x=scale_down_df['timestamp'], y=scale_down_df['utilization'], mode='markers', marker=dict(symbol='triangle-down', size=16, color='#e74c3c', line=dict(width=1, color='white')), name=f"{model_name} (Scale Down)", legendgroup=model_name, showlegend=False, hoverinfo='text', hovertext=[f"<b>SCALE DOWN EVENT</b><br>Instances: {row['instances']}<br>Action: {row['action_taken']}" for _, row in scale_down_df.iterrows()]))
 
-    fig.update_layout(**base_layout, title='Model Utilization (%) & Scaling Events')
+    fig.update_layout(**base_layout, title='Model Utilization (%) & Scaling Events',dragmode='pan')
     fig.update_yaxes(range=[0, 100], fixedrange=True)
     fig.update_xaxes(hoverformat="%Y-%m-%d %H:%M:%S", tickformatstops=[dict(dtickrange=[None, 60000], value="%H:%M:%S"), dict(dtickrange=[60000, 86400000], value="%H:%M\n%b %d"), dict(dtickrange=[86400000, None], value="%b %d\n%Y")])
     return fig, dropdown_options
