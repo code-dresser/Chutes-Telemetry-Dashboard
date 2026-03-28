@@ -2,12 +2,12 @@ import os
 import dash
 from dash import dcc, html, Input, Output, State, ALL, ctx
 import dash_bootstrap_components as dbc
+from flask import jsonify
 import requests
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 from sqlalchemy import create_engine, text
-from apscheduler.schedulers.background import BackgroundScheduler
 
 # ==========================================
 # 1. CONFIGURATION & SETUP
@@ -16,52 +16,28 @@ CHUTES_API_URL = "https://api.chutes.ai"
 CHUTES_API_KEY = os.environ.get("CHUTES_API_KEY")
 
 # Render will provide this URL once you connect Neon
-# It will look like: postgresql://user:password@hostname/dbname
 DATABASE_URL = os.environ.get("DATABASE_URL") 
 engine = create_engine(DATABASE_URL)
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 server = app.server 
 
-def load_initial_data():
-    """Loads up to 600k records from Postgres on startup."""
-    empty_df = pd.DataFrame(columns=["timestamp", "name", "utilization", "instances", "action_taken"])
-    try:
-        # Check if table exists by doing a quick query
-        with engine.connect() as conn:
-            df = pd.read_sql("SELECT * FROM telemetry ORDER BY timestamp DESC LIMIT 600000", conn)
-            
-        if df.empty:
-            return empty_df
-            
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df['name'] = df['name'].astype('category')
-        df['action_taken'] = df['action_taken'].astype('category')
-        return df
-    except Exception as e:
-        print(f"Postgres not initialized or empty. Starting fresh: {e}")
-        return empty_df
-
-# Global memory bank
-historical_data = load_initial_data()
-
 # ==========================================
-# 2. AUTONOMOUS BACKEND SCHEDULER
+# 2. EXTERNAL FETCH ENDPOINT (For GitHub Actions)
 # ==========================================
-def autonomous_data_fetch():
-    """Runs in the background every 3 minutes, independent of the browser."""
-    global historical_data
+@server.route('/api/trigger-fetch', methods=['GET', 'POST'])
+def trigger_fetch():
+    """Triggered by an external Cron (e.g. GitHub Actions) every 3 minutes."""
     headers = {"Authorization": f"Bearer {CHUTES_API_KEY}"}
     
     try:
-        response = requests.get(f"{CHUTES_API_URL}/chutes/utilization", headers=headers, timeout=10)
+        # Increased timeout to 30s as discussed to prevent gap formation
+        response = requests.get(f"{CHUTES_API_URL}/chutes/utilization", headers=headers, timeout=30)
         response.raise_for_status()
         data = response.json()
         
         parsed_data = []
         chutes_list = data if isinstance(data, list) else data.get("items", [])
-        current_time = datetime.now()
         
         for chute in chutes_list:
             name = chute.get("name", "Unknown Model")
@@ -70,9 +46,9 @@ def autonomous_data_fetch():
             parsed_data.append({
                     "name": name,
                     "timestamp": pd.to_datetime(chute.get("timestamp", "N/A")),
-                    "instances": chute.get("instance_count", 0),# Tracks scaling up/down
-                    "action_taken": chute.get("action_taken", "None"), # Tracks actions taken
-                    "utilization": round(chute.get("utilization_current", 0.0) * 100, 2) # Tracks utilization %
+                    "instances": chute.get("instance_count", 0),
+                    "action_taken": chute.get("action_taken", "no_action_taken"),
+                    "utilization": round(chute.get("utilization_current", 0.0) * 100, 2)
             })
             
         new_df = pd.DataFrame(parsed_data)
@@ -80,62 +56,77 @@ def autonomous_data_fetch():
         if not new_df.empty:
             new_df['timestamp'] = pd.to_datetime(new_df['timestamp']).dt.round('s')
             
-            # 1. Save to Postgres
+            # Save directly to Postgres
             with engine.begin() as conn:
                 new_df.to_sql('telemetry', conn, if_exists='append', index=False)
-                # Postgres uses NOW() - INTERVAL '14 days' instead of SQLite's syntax
+                # Prune old data
                 conn.execute(text("DELETE FROM telemetry WHERE timestamp <= NOW() - INTERVAL '14 days'"))
             
-            # 2. Update server memory
-            historical_data = pd.concat([historical_data, new_df], ignore_index=True)
-            historical_data['name'] = historical_data['name'].astype('category')
-            historical_data['action_taken'] = historical_data['action_taken'].astype('category')
-            historical_data = historical_data.tail(600000)
-            print(f"[{datetime.now()}] Successfully fetched and saved {len(new_df)} records.")
+            return jsonify({"status": "success", "message": f"Fetched and saved {len(new_df)} records."}), 200
             
     except Exception as e:
-        print(f"Background fetch error: {e}")
+        print(f"Fetch error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-# Start the background task immediately on server boot
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=autonomous_data_fetch, trigger="interval", minutes=3)
-autonomous_data_fetch()  # Initial fetch on startup
-scheduler.start()
+    return jsonify({"status": "success", "message": "No new data to fetch."}), 200
+
 
 # ==========================================
-# 3. DASHBOARD LAYOUT
+# 3. DASHBOARD LAYOUT (Dynamic on Page Load)
 # ==========================================
-app.layout = dbc.Container([
-    dbc.Row(dbc.Col(html.H2("Chutes.ai Telemetry", className="text-center my-3 text-light")), style={'flex-shrink': '0'}),
-    
-    # UI Refresh Interval (only updates the charts from memory, doesn't hit APIs)
-    dcc.Interval(id='ui-refresh-interval', interval=3*60*1000, n_intervals=0),
-    dcc.Store(id='selected-models-store', data=[], storage_type='local'), 
-    
-    dbc.Row([
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.Label("Search & Add Models to Display:", className="fw-bold mb-2"),
-                    dcc.Dropdown(id='model-adder', multi=False, placeholder="Type a model name to search...", style={'color': '#000'}),
-                    dbc.Switch(id='toggle-scaling-markers', label="Show Scale Up/Down Markers", value=True, className="mt-3 fw-bold text-info"),
-                    html.Div(id='pill-container', className="mt-2 d-flex flex-wrap gap-2")
-                ], className="py-2") 
-            ], className="mb-3 shadow-sm")
-        ], width=12)
-    ], style={'flex-shrink': '0'}),
-    
-    dbc.Row([
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    dcc.Graph(id='utilization-chart', style={'height': '100%'}, config={'displayModeBar': False, 'displaylogo': False, 'scrollZoom': True})
-                ], className="d-flex flex-column", style={'height': '100%', 'padding': '0'}) 
-            ], className="shadow-sm d-flex flex-column", style={'height': '100%'})
-        ], width=12, className="d-flex flex-column", style={'height': '100%'})
-    ], className="flex-grow-1 pb-3", style={'min-height': '0'}) 
+def serve_layout():
+    """Runs exactly ONCE when a user opens the dashboard in their browser."""
+    available_models = []
+    try:
+        # 1. Quickly grab unique model names for the dropdown
+        with engine.connect() as conn:
+            models_df = pd.read_sql("SELECT DISTINCT name FROM telemetry", conn)
+        available_models = models_df['name'].tolist()
+    except Exception as e:
+        print(f"Could not load initial models (DB might be empty): {e}")
 
-], fluid=True, className="d-flex flex-column", style={'height': '100vh', 'padding': '1rem'})
+    return dbc.Container([
+        dbc.Row(dbc.Col(html.H2("Chutes.ai Telemetry", className="text-center my-3 text-light")), style={'flex-shrink': '0'}),
+        
+        # UI Refresh Interval (Triggers chart update every 3 minutes)
+        dcc.Interval(id='ui-refresh-interval', interval=3*60*1000, n_intervals=0),
+        
+        # Local Storage persists across sessions
+        dcc.Store(id='selected-models-store', data=[], storage_type='local'), 
+        
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.Label("Search & Add Models to Display:", className="fw-bold mb-2"),
+                        dcc.Dropdown(
+                            id='model-adder', 
+                            options=[{'label': m, 'value': m} for m in available_models],
+                            multi=False, 
+                            placeholder="Type a model name to search...", 
+                            style={'color': '#000'}
+                        ),
+                        dbc.Switch(id='toggle-scaling-markers', label="Show Scale Up/Down Markers", value=True, className="mt-3 fw-bold text-info"),
+                        html.Div(id='pill-container', className="mt-2 d-flex flex-wrap gap-2")
+                    ], className="py-2") 
+                ], className="mb-3 shadow-sm")
+            ], width=12)
+        ], style={'flex-shrink': '0'}),
+        
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        dcc.Graph(id='utilization-chart', style={'height': '100%'}, config={'displayModeBar': False, 'displaylogo': False, 'scrollZoom': True})
+                    ], className="d-flex flex-column", style={'height': '100%', 'padding': '0'}) 
+                ], className="shadow-sm d-flex flex-column", style={'height': '100%'})
+            ], width=12, className="d-flex flex-column", style={'height': '100%'})
+        ], className="flex-grow-1 pb-3", style={'min-height': '0'}) 
+
+    ], fluid=True, className="d-flex flex-column", style={'height': '100vh', 'padding': '1rem'})
+
+# Tell Dash to call the function to build the layout
+app.layout = serve_layout
 
 # ==========================================
 # 4. CALLBACKS
@@ -169,31 +160,43 @@ def render_pills(selected_models):
 
 @app.callback(
     Output('utilization-chart', 'figure'),
-    Output('model-adder', 'options'),
     Input('ui-refresh-interval', 'n_intervals'),
     Input('selected-models-store', 'data'),
     Input('toggle-scaling-markers', 'value')
 )
 def update_dashboard(n, selected_models, show_markers):
-    # This callback ONLY reads from memory now! The background scheduler does the API fetching.
-    global historical_data
-    
     fig = go.Figure()
     base_layout = dict(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', margin=dict(l=40, r=40, t=60, b=40), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
 
-    if historical_data.empty:
-        return fig.update_layout(**base_layout, title="Awaiting Data from Scheduler..."), []
-
-    dropdown_options = [{'label': m, 'value': m} for m in historical_data['name'].unique()]
-
     if not selected_models:
-        return fig.update_layout(**base_layout, title="Select a model above to view utilization", xaxis=dict(visible=False), yaxis=dict(visible=False)), dropdown_options
+        return fig.update_layout(**base_layout, title="Select a model above to view utilization", xaxis=dict(visible=False), yaxis=dict(visible=False))
 
-    filtered_df = historical_data[historical_data['name'].isin(selected_models)]
+    # --- Fetch ONLY the data needed for the selected models from Postgres ---
+    models_tuple = tuple(selected_models)
+    
+    if len(selected_models) == 1:
+        query = f"SELECT * FROM telemetry WHERE name = '{selected_models[0]}' ORDER BY timestamp DESC LIMIT 10000"
+    else:
+        query = f"SELECT * FROM telemetry WHERE name IN {models_tuple} ORDER BY timestamp DESC LIMIT 10000"
+
+    try:
+        with engine.connect() as conn:
+            filtered_df = pd.read_sql(query, conn)
+    except Exception as e:
+        print(f"Error querying DB for chart: {e}")
+        return fig.update_layout(**base_layout, title="Database Error while fetching chart data.")
+
+    if filtered_df.empty:
+        return fig.update_layout(**base_layout, title="Awaiting Data...")
+
+    # Sort chronologically so the Plotly lines connect correctly left-to-right
+    filtered_df['timestamp'] = pd.to_datetime(filtered_df['timestamp'])
+    filtered_df = filtered_df.sort_values('timestamp')
 
     for model_name in selected_models:
         model_df = filtered_df[filtered_df['name'] == model_name].copy()
-        model_df = model_df.sort_values('timestamp')
+        if model_df.empty:
+            continue
 
         model_df['prev_instances'] = model_df['instances'].shift(1)
         model_df['instance_diff'] = model_df['instances'] - model_df['prev_instances']
@@ -213,8 +216,8 @@ def update_dashboard(n, selected_models, show_markers):
     fig.update_layout(**base_layout, title='Model Utilization (%) & Scaling Events',dragmode='pan')
     fig.update_yaxes(range=[0, 100], fixedrange=True)
     fig.update_xaxes(hoverformat="%Y-%m-%d %H:%M:%S", tickformatstops=[dict(dtickrange=[None, 60000], value="%H:%M:%S"), dict(dtickrange=[60000, 86400000], value="%H:%M\n%b %d"), dict(dtickrange=[86400000, None], value="%b %d\n%Y")])
-    return fig, dropdown_options
+    return fig
 
 if __name__ == '__main__':
-    # Force single threaded mode for local testing to prevent scheduler duplication
-    app.run(debug=False, threaded=False)
+    # Threading is safe now!
+    app.run(debug=False, threaded=True)
