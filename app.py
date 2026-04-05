@@ -60,7 +60,7 @@ def trigger_fetch():
             with engine.begin() as conn:
                 new_df.to_sql('telemetry', conn, if_exists='append', index=False)
                 # Prune old data
-                conn.execute(text("DELETE FROM telemetry WHERE timestamp <= NOW() - INTERVAL '14 days'"))
+                conn.execute(text("DELETE FROM telemetry WHERE timestamp <= NOW() - INTERVAL '14 day'"))
             
             return jsonify({"status": "success", "message": f"Fetched and saved {len(new_df)} records."}), 200
             
@@ -120,7 +120,14 @@ def serve_layout():
                         dcc.Graph(id='utilization-chart', style={'height': '100%'}, config={'displayModeBar': False, 'displaylogo': False, 'scrollZoom': True})
                     ], className="d-flex flex-column", style={'height': '100%', 'padding': '0'}) 
                 ], className="shadow-sm d-flex flex-column", style={'height': '100%'})
-            ], width=12, className="d-flex flex-column", style={'height': '100%'})
+            ], width=12, className="d-flex flex-column", style={'height': '100%'}),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        dcc.Graph(id='daily-avg-chart', style={'height': '100%'}, config={'displayModeBar': False, 'displaylogo': False})
+                    ], className="d-flex flex-column", style={'height': '100%', 'padding': '0'}) 
+                ], className="shadow-sm d-flex flex-column", style={'height': '35vh'}) # Smaller chart for averages
+            ], width=12)
         ], className="flex-grow-1 pb-3", style={'min-height': '0'}) 
 
     ], fluid=True, className="d-flex flex-column", style={'height': '100vh', 'padding': '1rem'})
@@ -159,64 +166,119 @@ def render_pills(selected_models):
     return [dbc.Button([m, dbc.Badge("X", color="danger", className="ms-2")], id={'type': 'remove-pill', 'index': m}, color="info", outline=True, size="sm", className="rounded-pill d-flex align-items-center") for m in selected_models]
 
 @app.callback(
-    Output('utilization-chart', 'figure'),
+    [Output('utilization-chart', 'figure'),
+     Output('daily-avg-chart', 'figure')], # Added second output
     Input('ui-refresh-interval', 'n_intervals'),
     Input('selected-models-store', 'data'),
     Input('toggle-scaling-markers', 'value')
 )
 def update_dashboard(n, selected_models, show_markers):
-    fig = go.Figure()
+    line_fig = go.Figure()
+    bar_fig = go.Figure()
+    
     base_layout = dict(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', margin=dict(l=40, r=40, t=60, b=40), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
 
     if not selected_models:
-        return fig.update_layout(**base_layout, title="Select a model above to view utilization", xaxis=dict(visible=False), yaxis=dict(visible=False))
+        empty_layout = base_layout.copy()
+        empty_layout.update(title="Select a model above to view telemetry", xaxis=dict(visible=False), yaxis=dict(visible=False))
+        return line_fig.update_layout(**empty_layout), bar_fig.update_layout(**empty_layout)
 
-    # --- Fetch ONLY the data needed for the selected models from Postgres ---
-    models_tuple = tuple(selected_models)
+    # Format the SQL IN clause safely
+    models_sql = f"('{selected_models[0]}')" if len(selected_models) == 1 else str(tuple(selected_models))
+
+    # --- QUERY 1: RAW DATA (Last 72 Hours only) ---
+    raw_query = f"""
+        SELECT * FROM telemetry 
+        WHERE name IN {models_sql} AND timestamp >= NOW() - INTERVAL '72 hours'
+        ORDER BY timestamp ASC
+    """
     
-    if len(selected_models) == 1:
-        query = f"SELECT * FROM telemetry WHERE name = '{selected_models[0]}' ORDER BY timestamp DESC LIMIT 10000"
-    else:
-        query = f"SELECT * FROM telemetry WHERE name IN {models_tuple} ORDER BY timestamp DESC LIMIT 10000"
+    # --- QUERY 2: AGGREGATED DATA (Daily Averages for all history) ---
+    avg_query = f"""
+        SELECT DATE(timestamp) as date, name, AVG(utilization) as avg_utilization
+        FROM telemetry 
+        WHERE name IN {models_sql}
+        GROUP BY DATE(timestamp), name
+        ORDER BY date ASC
+    """
 
     try:
         with engine.connect() as conn:
-            filtered_df = pd.read_sql(query, conn)
+            filtered_df = pd.read_sql(raw_query, conn)
+            avg_df = pd.read_sql(avg_query, conn)
     except Exception as e:
         print(f"Error querying DB for chart: {e}")
-        return fig.update_layout(**base_layout, title="Database Error while fetching chart data.")
+        error_layout = base_layout.copy()
+        error_layout.update(title="Database Error while fetching chart data.")
+        return line_fig.update_layout(**error_layout), bar_fig.update_layout(**error_layout)
 
-    if filtered_df.empty:
-        return fig.update_layout(**base_layout, title="Awaiting Data...")
+    # ==========================================
+    # BUILD LINE CHART (96 Hours)
+    # ==========================================
+    if not filtered_df.empty:
+        filtered_df['timestamp'] = pd.to_datetime(filtered_df['timestamp'])
+        
+        for model_name in selected_models:
+            model_df = filtered_df[filtered_df['name'] == model_name].copy()
+            if model_df.empty: continue
 
-    # Sort chronologically so the Plotly lines connect correctly left-to-right
-    filtered_df['timestamp'] = pd.to_datetime(filtered_df['timestamp'])
-    filtered_df = filtered_df.sort_values('timestamp')
+            model_df['prev_instances'] = model_df['instances'].shift(1)
+            model_df['instance_diff'] = model_df['instances'] - model_df['prev_instances']
 
-    for model_name in selected_models:
-        model_df = filtered_df[filtered_df['name'] == model_name].copy()
-        if model_df.empty:
-            continue
+            is_scale_up = (model_df['action_taken'].astype(str).str.contains('up', case=False, na=False)) | (model_df['instance_diff'] > 0)
+            is_scale_down = (model_df['action_taken'].astype(str).str.contains('down', case=False, na=False)) | (model_df['instance_diff'] < 0)
 
-        model_df['prev_instances'] = model_df['instances'].shift(1)
-        model_df['instance_diff'] = model_df['instances'] - model_df['prev_instances']
+            scale_up_df = model_df[is_scale_up]
+            scale_down_df = model_df[is_scale_down]
 
-        is_scale_up = (model_df['action_taken'].astype(str).str.contains('up', case=False, na=False)) | (model_df['instance_diff'] > 0)
-        is_scale_down = (model_df['action_taken'].astype(str).str.contains('down', case=False, na=False)) | (model_df['instance_diff'] < 0)
+            # Line Chart with updated Timestamps in hovertext
+            line_fig.add_trace(go.Scatter(
+                x=model_df['timestamp'], y=model_df['utilization'], mode='lines+markers', name=model_name, 
+                line=dict(width=2), marker=dict(size=6), legendgroup=model_name, hoverinfo='text', 
+                hovertext=[f"Time: {row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}<br>Model: {model_name}<br>Util: {row['utilization']}%<br>Instances: {row['instances']}" for _, row in model_df.iterrows()]
+            ))
 
-        scale_up_df = model_df[is_scale_up]
-        scale_down_df = model_df[is_scale_down]
+            if show_markers:
+                if not scale_up_df.empty: 
+                    line_fig.add_trace(go.Scatter(
+                        x=scale_up_df['timestamp'], y=scale_up_df['utilization'], mode='markers', 
+                        marker=dict(symbol='triangle-up', size=16, color='#2ecc71', line=dict(width=1, color='white')), 
+                        name=f"{model_name} (Scale Up)", legendgroup=model_name, showlegend=False, hoverinfo='text', 
+                        hovertext=[f"<b>SCALE UP</b><br>Time: {row['timestamp'].strftime('%H:%M:%S')}<br>Instances: {row['instances']}<br>Action: {row['action_taken']}" for _, row in scale_up_df.iterrows()]
+                    ))
+                if not scale_down_df.empty: 
+                    line_fig.add_trace(go.Scatter(
+                        x=scale_down_df['timestamp'], y=scale_down_df['utilization'], mode='markers', 
+                        marker=dict(symbol='triangle-down', size=16, color='#e74c3c', line=dict(width=1, color='white')), 
+                        name=f"{model_name} (Scale Down)", legendgroup=model_name, showlegend=False, hoverinfo='text', 
+                        hovertext=[f"<b>SCALE DOWN</b><br>Time: {row['timestamp'].strftime('%H:%M:%S')}<br>Instances: {row['instances']}<br>Action: {row['action_taken']}" for _, row in scale_down_df.iterrows()]
+                    ))
 
-        fig.add_trace(go.Scatter(x=model_df['timestamp'], y=model_df['utilization'], mode='lines+markers', name=model_name, line=dict(width=2), marker=dict(size=6), legendgroup=model_name, hoverinfo='text', hovertext=[f"Time: {row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}<br>Model: {model_name}<br>Util: {row['utilization']}%<br>Instances: {row['instances']}" for _, row in model_df.iterrows()]))
+    line_fig.update_layout(**base_layout, title='Real-time Utilization & Scaling (Last 72 Hours)', dragmode='pan')
+    line_fig.update_yaxes(range=[0, 100], fixedrange=True)
+    
+    # ==========================================
+    # BUILD BAR CHART (Daily Averages)
+    # ==========================================
+    if not avg_df.empty:
+        for model_name in selected_models:
+            model_avg = avg_df[avg_df['name'] == model_name]
+            if model_avg.empty: continue
+            
+            bar_fig.add_trace(go.Bar(
+                x=model_avg['date'],
+                y=model_avg['avg_utilization'],
+                name=model_name,
+                legendgroup=model_name,
+                showlegend=False, # Avoid duplicating legend items since line chart has them
+                hoverinfo='text',
+                hovertext=[f"Date: {row['date']}<br>Model: {model_name}<br>Avg Util: {row['avg_utilization']:.2f}%" for _, row in model_avg.iterrows()]
+            ))
 
-        if show_markers:
-            if not scale_up_df.empty: fig.add_trace(go.Scatter(x=scale_up_df['timestamp'], y=scale_up_df['utilization'], mode='markers', marker=dict(symbol='triangle-up', size=16, color='#2ecc71', line=dict(width=1, color='white')), name=f"{model_name} (Scale Up)", legendgroup=model_name, showlegend=False, hoverinfo='text', hovertext=[f"<b>SCALE UP EVENT</b><br>Instances: {row['instances']}<br>Action: {row['action_taken']}<br>Time: {row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}" for _, row in scale_up_df.iterrows()]))
-            if not scale_down_df.empty: fig.add_trace(go.Scatter(x=scale_down_df['timestamp'], y=scale_down_df['utilization'], mode='markers', marker=dict(symbol='triangle-down', size=16, color='#e74c3c', line=dict(width=1, color='white')), name=f"{model_name} (Scale Down)", legendgroup=model_name, showlegend=False, hoverinfo='text', hovertext=[f"<b>SCALE DOWN EVENT</b><br>Instances: {row['instances']}<br>Action: {row['action_taken']}<br>Time: {row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}" for _, row in scale_down_df.iterrows()]))
+    bar_fig.update_layout(**base_layout, title='Historical Daily Average Utilization', barmode='group', dragmode='pan')
+    bar_fig.update_yaxes(range=[0, 100], fixedrange=True)
 
-    fig.update_layout(**base_layout, title='Model Utilization (%) & Scaling Events',dragmode='pan')
-    fig.update_yaxes(range=[0, 100], fixedrange=True)
-    fig.update_xaxes(hoverformat="%Y-%m-%d %H:%M:%S", tickformatstops=[dict(dtickrange=[None, 60000], value="%H:%M:%S"), dict(dtickrange=[60000, 86400000], value="%H:%M\n%b %d"), dict(dtickrange=[86400000, None], value="%b %d\n%Y")])
-    return fig
+    return line_fig, bar_fig
 
 if __name__ == '__main__':
     # Threading is safe now!
